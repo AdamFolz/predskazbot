@@ -41,67 +41,12 @@ def extract_mentions(text: str) -> list[str]:
 
 
 async def fetch_live_web_info(user_text: str) -> str:
-    """Lightweight live internet retrieval for household/practical queries."""
-    if not user_text:
-        return ""
-    lowered = user_text.lower()
-    snippets: list[str] = []
-
+    """Backward-compatible wrapper around web_search.live_web_context."""
     try:
-        import httpx
-        async with httpx.AsyncClient(timeout=4.5) as client:
-            # 1. Weather lookup
-            weather_match = re.search(
-                r"(?:погод[а-я]*|температур[а-я]*|дождь|снег|прогноз\s+погоды)\s+(?:в\s+|на\s+)?([а-яА-Яa-zA-Z-]+)",
-                lowered,
-            )
-            if weather_match or "погод" in lowered:
-                city = weather_match.group(1).title() if weather_match else "Moscow"
-                city_clean = city.replace("Москве", "Moscow").replace("Питере", "Saint Petersburg").replace("Туле", "Tula")
-                try:
-                    r = await client.get(f"http://wttr.in/{city_clean}?M&format=%l:+%c+%t+(ощущается+как+%f),+ветер+%w,+влажность+%h")
-                    if r.status_code == 200 and "Unknown" not in r.text and len(r.text.strip()) < 150:
-                        snippets.append(f"Погода ({city_clean}): {r.text.strip()}")
-                except Exception:
-                    pass
-
-            # 2. Currency/exchange rate lookup
-            if any(w in lowered for w in ["курс", "доллар", "евро", "биток", "биткоин", "usd", "btc", "rub"]):
-                try:
-                    r = await client.get("https://api.coingecko.com/api/v3/simple/price?ids=bitcoin,ethereum&vs_currencies=usd,rub")
-                    if r.status_code == 200:
-                        data = r.json()
-                        btc_usd = data.get("bitcoin", {}).get("usd", 0)
-                        btc_rub = data.get("bitcoin", {}).get("rub", 0)
-                        if btc_usd:
-                            snippets.append(f"Курс Bitcoin (BTC): ${btc_usd:,.0f} / {btc_rub:,.0f} RUB")
-                except Exception:
-                    pass
-
-            # 3. DuckDuckGo quick factual search if asked practical/factual questions
-            if any(lowered.startswith(p) or f" {p} " in lowered for p in ["что такое", "кто такой", "как сделать", "рецепт", "новости", "почему", "когда будет", "сколько стоит", "как доехать"]):
-                try:
-                    import urllib.parse
-                    query = urllib.parse.quote(user_text[:100])
-                    r = await client.get(
-                        f"https://html.duckduckgo.com/html/?q={query}",
-                        headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
-                    )
-                    if r.status_code == 200:
-                        found = re.findall(r'<a class="result__snippet[^>]*>(.*?)</a>', r.text, re.DOTALL)
-                        clean_found = []
-                        for s in found[:2]:
-                            clean_s = re.sub(r'<[^>]+>', '', s).strip()
-                            if clean_s:
-                                clean_found.append(clean_s)
-                        if clean_found:
-                            snippets.append("Справка из интернета: " + " | ".join(clean_found))
-                except Exception:
-                    pass
+        from web_search import live_web_context
+        return await live_web_context(user_text, force=False)
     except Exception:
-        pass
-
-    return "\n".join(snippets)
+        return ""
 
 
 def is_too_similar(candidate: str, previous_texts: Iterable[str]) -> tuple[bool, str]:
