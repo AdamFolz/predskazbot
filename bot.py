@@ -1420,12 +1420,20 @@ def _message_addresses_bot(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             if ent.user and ent.user.id == bot_id:
                 return True
 
-    text_lower = msg.text.lower()
+    text_lower = msg.text.lower().replace("ё", "е")
+    # Slang / brand / diminutives used in the confa
     trigger_words = [
         "хуебот",
-        "хуёбот",
+        "хуеботик",
+        "еблобот",
+        "еблоботик",
+        "еблбот",
         "hyebot",
         "hye bot",
+        "hye-bot",
+        "ботик",
+        "ботяра",
+        "ботя",
         "сексялка",
         "бафик",
         "предсказалка",
@@ -1433,16 +1441,31 @@ def _message_addresses_bot(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         "predskazbot",
         "оракул",
         "seksyalka",
+        "seksyalka_predskazalka_bot",
     ]
     if bot_username:
         trigger_words.append(f"@{bot_username}")
         trigger_words.append(bot_username)
 
-    # whole-word "бот" (not "работа", "ботан")
-    if re.search(r"(^|[\s,.:;!?«\"'(])бот([\s,.:;!?»\"')]|$)", text_lower):
+    if any(w in text_lower for w in trigger_words):
         return True
 
-    return any(w in text_lower for w in trigger_words)
+    # whole-word "бот" / "bot" (not "работа", "ботан", "робот")
+    if re.search(r"(^|[\s,.:;!?«\"'(])бот([\s,.:;!?»\"')]|$)", text_lower):
+        return True
+    if re.search(r"(^|[\s,.:;!?\"'(])bot([\s,.:;!?\"')]|$)", text_lower):
+        return True
+
+    # any token that *is* a bot-call: *бот / *bot (еблобот, хуебот, mybot…)
+    # but reject long normal words containing бот mid-stem via length/suffix check
+    for tok in re.findall(r"[a-zа-я0-9_@]+", text_lower):
+        if tok in {"работа", "работать", "работаю", "ботаник", "ботан", "робот", "роботы"}:
+            continue
+        if tok.endswith("бот") or tok.endswith("bot") or tok.endswith("ботик"):
+            if 3 <= len(tok) <= 24:
+                return True
+
+    return False
 
 
 async def chat_participant_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
