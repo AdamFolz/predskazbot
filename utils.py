@@ -155,12 +155,6 @@ def safe_format(template: str, **kwargs) -> str:
 def clean_bot_reply(text: str) -> str:
     text = text.strip()
     text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
-    # Some non-OpenAI models (GLM/LLaMA) emit their own tool-call syntax as
-    # plain text content instead of populating message.tool_calls. Strip any
-    # such leakage so it never reaches the user, whether closed or dangling.
-    text = re.sub(r"<tool_call>.*?</tool_call>", "", text, flags=re.DOTALL)
-    text = re.sub(r"<tool_call>.*", "", text, flags=re.DOTALL)
-    text = text.strip()
     text = re.sub(r"^```(?:\w+)?", "", text)
     text = re.sub(r"```$", "", text)
     text = text.strip().strip('"').strip()

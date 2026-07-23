@@ -19,26 +19,6 @@ from database import Database
 from knowledge_base import KnowledgeBase
 from memory import MemoryManager
 from prompts import ASK_PROMPT, CORE_STYLE_SYSTEM, FUTURE_PROMPT, KB_ANSWER_PROMPT, SUMMARY_PROMPT, PARTICIPANT_PROMPT
-
-# /set_style persists only the chosen preset's *module name* to /data — never
-# writes/copies over the local prompts.py file, since anything outside /data
-# is wiped on the next Amvera rebuild. On startup we just re-import whichever
-# preset module was last chosen and override the defaults loaded above.
-_STYLE_STATE_PATH = Path("/data/style_choice.txt")
-try:
-    if _STYLE_STATE_PATH.exists():
-        _saved_module = _STYLE_STATE_PATH.read_text(encoding="utf-8").strip()
-        if _saved_module:
-            import importlib as _importlib
-            _preset = _importlib.import_module(_saved_module)
-            CORE_STYLE_SYSTEM = _preset.CORE_STYLE_SYSTEM
-            FUTURE_PROMPT = _preset.FUTURE_PROMPT
-            SUMMARY_PROMPT = _preset.SUMMARY_PROMPT
-            ASK_PROMPT = _preset.ASK_PROMPT
-            KB_ANSWER_PROMPT = _preset.KB_ANSWER_PROMPT
-            PARTICIPANT_PROMPT = _preset.PARTICIPANT_PROMPT
-except Exception:
-    pass  # fall back to whatever prompts.py ships with — never block startup on this
 from utils import clean_bot_reply, extract_mentions, is_too_similar, safe_format, safe_short
 
 
@@ -130,15 +110,6 @@ def _llm_kwargs(extra: dict | None = None) -> dict:
     if extra:
         base.update(extra)
     return {"extra_body": base} if base else {}
-
-
-def _supports_native_tools() -> bool:
-    """GLM-5.1/LLaMA (Amvera) don't reliably populate message.tool_calls —
-    they often emit their own tool-call syntax as plain text instead, which
-    then leaks to users. Only trust tools= for model families known to
-    return proper structured tool_calls."""
-    model = OPENAI_MODEL.lower()
-    return any(model.startswith(p) for p in ("gpt-", "o1-", "o3-", "openai/"))
 
 future_rate_limit: dict[tuple[int, int], float] = defaultdict(float)
 ask_rate_limit: dict[tuple[int, int], float] = defaultdict(float)
@@ -561,7 +532,7 @@ async def kbask(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = chat_id_of(update)
     user_id = user_id_of(update)
     try:
-        await asyncio.to_thread(db.add_bot_response, chat_id, user_id, "kbask", reply)
+        db.add_bot_response(chat_id, user_id, "kbask", reply)
         memory_manager.record_v2_bot_response(chat_id=chat_id, user_id=user_id, command="kbask", response_text=reply)
     except Exception:
         logger.exception("Failed to save kbask response")
@@ -780,7 +751,7 @@ async def summary(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         response = await openai_client.chat.completions.create(
             model=OPENAI_MODEL,
             temperature=0.5,
-            max_tokens=1500,
+            max_tokens=600,
             **_llm_kwargs(),
                 messages=[
                 {"role": "system", "content": CORE_STYLE_SYSTEM},
@@ -801,11 +772,9 @@ async def summary(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     reply = clean_bot_reply(response.choices[0].message.content or "")
     if not reply:
         reply = "Летопись не сложилась. Видимо, конфа сегодня превзошла письменность."
-    elif response.choices and getattr(response.choices[0], "finish_reason", None) == "length":
-        reply = reply.rstrip() + "…"
 
     try:
-        await asyncio.to_thread(db.add_bot_response, chat_id, None, "summary", reply)
+        db.add_bot_response(chat_id, None, "summary", reply)
         memory_manager.record_v2_bot_response(chat_id=chat_id, user_id=None, command="summary", response_text=reply)
     except Exception:
         logger.exception("Failed to save summary response")
@@ -896,7 +865,7 @@ async def future(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             chosen = "Оракул завис. Видимо, будущее посмотрело на конфу и решило не загружаться."
 
     try:
-        await asyncio.to_thread(db.add_bot_response, chat_id, user_id, "future", chosen)
+        db.add_bot_response(chat_id, user_id, "future", chosen)
         memory_manager.record_v2_bot_response(chat_id=chat_id, user_id=user_id, command="future", response_text=chosen)
     except Exception:
         logger.exception("Failed to save future response")
@@ -992,7 +961,7 @@ async def ask(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         reply = "Не получилось собрать внятный ответ."
 
     try:
-        await asyncio.to_thread(db.add_bot_response, chat_id, user_id, "ask", reply)
+        db.add_bot_response(chat_id, user_id, "ask", reply)
         memory_manager.record_v2_bot_response(chat_id=chat_id, user_id=user_id, command="ask", response_text=reply)
     except Exception:
         logger.exception("Failed to save ask response")
@@ -1218,20 +1187,17 @@ async def set_style(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await safe_send(update, f"❌ Файл пресета {source_file} не найден на сервере.")
         return
 
-    module_name = source_file[:-3] if source_file.endswith(".py") else source_file
     try:
-        import importlib
-        preset = importlib.import_module(module_name)
-        importlib.reload(preset)
-        CORE_STYLE_SYSTEM = preset.CORE_STYLE_SYSTEM
-        FUTURE_PROMPT = preset.FUTURE_PROMPT
-        SUMMARY_PROMPT = preset.SUMMARY_PROMPT
-        ASK_PROMPT = preset.ASK_PROMPT
-        KB_ANSWER_PROMPT = preset.KB_ANSWER_PROMPT
-        PARTICIPANT_PROMPT = preset.PARTICIPANT_PROMPT
-        _STYLE_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
-        _STYLE_STATE_PATH.write_text(module_name, encoding="utf-8")
-        await safe_send(update, f"✅ Стиль успешно переключён на {style} ({source_file}) и горячо перезагружен в памяти! Переживёт редеплой.")
+        import shutil, importlib, prompts
+        shutil.copy(p, "prompts.py")
+        importlib.reload(prompts)
+        CORE_STYLE_SYSTEM = prompts.CORE_STYLE_SYSTEM
+        FUTURE_PROMPT = prompts.FUTURE_PROMPT
+        SUMMARY_PROMPT = prompts.SUMMARY_PROMPT
+        ASK_PROMPT = prompts.ASK_PROMPT
+        KB_ANSWER_PROMPT = prompts.KB_ANSWER_PROMPT
+        PARTICIPANT_PROMPT = prompts.PARTICIPANT_PROMPT
+        await safe_send(update, f"✅ Стиль успешно переключён на {style} ({source_file}) и горячо перезагружен в памяти!")
     except Exception as exc:
         await safe_send(update, f"❌ Ошибка переключения стиля: {exc}")
 
@@ -1425,8 +1391,16 @@ async def execute_agent_tool(chat_id: int, user_id: int, tool_name: str, argumen
         return f"Ошибка при выполнении инструмента {tool_name}: {exc}"
 
 
+def _supports_native_tools() -> bool:
+    """GLM/LLaMA often emit tool-call syntax as plain text instead of
+    structured tool_calls. Only trust tools= for model families known to
+    return proper structured tool_calls."""
+    model = OPENAI_MODEL.lower()
+    return any(model.startswith(p) for p in ("gpt-", "o1-", "o3-", "openai/"))
+
+
 def _message_addresses_bot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    """True if the user is talking to the bot (mention / name / slang / reply handled separately)."""
+    """True if the user is talking to the bot (mention / name / slang)."""
     msg = update.message
     if not msg or not msg.text:
         return False
@@ -1435,10 +1409,9 @@ def _message_addresses_bot(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     bot_username = (bot.username or "").lower()
     bot_id = bot.id
 
-    # Proper Telegram entities (@username or text_mention)
     for ent in msg.entities or []:
         et = getattr(ent, "type", None)
-        et_val = getattr(et, "value", et)  # Enum or str
+        et_val = getattr(et, "value", et)
         if et_val == "mention":
             mention = msg.text[ent.offset : ent.offset + ent.length].lower()
             if bot_username and mention == f"@{bot_username}":
@@ -1448,7 +1421,6 @@ def _message_addresses_bot(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 return True
 
     text_lower = msg.text.lower()
-    # Common names / slang / display branding (HYEBOT, Сексялка, …)
     trigger_words = [
         "хуебот",
         "хуёбот",
@@ -1464,10 +1436,9 @@ def _message_addresses_bot(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     ]
     if bot_username:
         trigger_words.append(f"@{bot_username}")
-        # bare username without @ (people type it)
         trigger_words.append(bot_username)
 
-    # "бот" as a whole word / address — not inside other words
+    # whole-word "бот" (not "работа", "ботан")
     if re.search(r"(^|[\s,.:;!?«\"'(])бот([\s,.:;!?»\"')]|$)", text_lower):
         return True
 
@@ -1486,13 +1457,12 @@ async def chat_participant_reply(update: Update, context: ContextTypes.DEFAULT_T
 
     await context.bot.send_chat_action(chat_id=chat_id, action="typing")
     try:
-        # Hot path: do NOT run memory curator here (already possibly run in store_message).
-        # Smaller context = much faster round-trip on glm/amvera.
-        ctx_msgs = int(os.getenv("PARTICIPANT_CONTEXT_MESSAGES", "20"))
+        # Hot path: never block on memory curator (extra LLM call).
+        ctx_msgs = int(os.getenv("PARTICIPANT_CONTEXT_MESSAGES", "15"))
         chat_context = memory_manager.build_chat_context(chat_id, ctx_msgs)
         user_profile = memory_manager.build_context_for_user(chat_id, user_id, 5)
 
-        # Live web is optional and slow (wttr/ddg). Off by default on hot path.
+        # Live web (wttr/ddg) is slow — off by default on mention path.
         if os.getenv("LIVE_WEB_ON_PARTICIPANT", "0") in ("1", "true", "True", "yes"):
             from utils import fetch_live_web_info
             live_web = await fetch_live_web_info(update.message.text)
@@ -1502,7 +1472,8 @@ async def chat_participant_reply(update: Update, context: ContextTypes.DEFAULT_T
                     14000,
                 )
 
-        max_out = int(os.getenv("PARTICIPANT_MAX_TOKENS", "350"))
+        max_out = int(os.getenv("PARTICIPANT_MAX_TOKENS", "280"))
+        use_tools = _supports_native_tools()
         msg_list = [
             {"role": "system", "content": CORE_STYLE_SYSTEM},
             {
@@ -1521,7 +1492,7 @@ async def chat_participant_reply(update: Update, context: ContextTypes.DEFAULT_T
                 model=OPENAI_MODEL,
                 temperature=0.8,
                 max_tokens=max_out,
-                **({"tools": AGENT_TOOLS, "tool_choice": "auto"} if _supports_native_tools() else {}),
+                **({"tools": AGENT_TOOLS, "tool_choice": "auto"} if use_tools else {}),
                 **_llm_kwargs(),
                 messages=msg_list,
             )
@@ -1534,7 +1505,7 @@ async def chat_participant_reply(update: Update, context: ContextTypes.DEFAULT_T
                 messages=msg_list,
             )
 
-        if response.choices and response.choices[0].message.tool_calls:
+        if use_tools and response.choices and response.choices[0].message.tool_calls:
             t_msg = response.choices[0].message
             msg_list.append(t_msg)
             for tc in t_msg.tool_calls:
@@ -1640,11 +1611,7 @@ async def store_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         if memory_manager.v2_full_transition or not memory_manager.v1_memory_fallback_enabled:
             return
 
-    if v1_saved:
-        # Memory curator is slow (extra LLM call). Never block a live reply on it —
-        # run after we decide whether to answer, and only when not about to reply.
-        pass
-    elif not v2_saved:
+    if not v1_saved and not v2_saved:
         logger.warning("Message was not saved in either v1 or v2 storage")
 
     should_reply = False
@@ -1674,9 +1641,9 @@ async def store_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                 spontaneous_rate_limit.pop(chat_id, None)
 
     if should_reply:
+        # Answer first — never wait on memory curator for a live reply.
         await chat_participant_reply(update, context)
     elif v1_saved:
-        # Background-ish: only curate memory when we are NOT answering right now.
         try:
             await memory_manager.maybe_update_memory(chat_id)
         except Exception:

@@ -1,0 +1,18 @@
+version: "3.9"
+services:
+  predskazbot:
+    build: .
+    container_name: predskazbot
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./predskazbot.sqlite3:/app/predskazbot.sqlite3
+      - ./predskazbot_v2.sqlite3:/app/predskazbot_v2.sqlite3
+      - ./exports:/app/exports
+      - ./AI_Knowledge_Base:/app/AI_Knowledge_Base:ro
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"

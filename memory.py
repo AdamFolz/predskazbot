@@ -1,8 +1,6 @@
-import asyncio
 import json
 import logging
 import os
-import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -334,8 +332,8 @@ class MemoryManager:
         every = int(os.getenv("MEMORY_UPDATE_EVERY_MESSAGES", "40"))
         min_messages = int(os.getenv("MEMORY_MIN_MESSAGES", "20"))
 
-        count = await asyncio.to_thread(self.db.count_messages, chat_id)
-        last = await asyncio.to_thread(self.db.get_meta_int, chat_id, "last_memory_update_message_count", 0)
+        count = self.db.count_messages(chat_id)
+        last = self.db.get_meta_int(chat_id, "last_memory_update_message_count", 0)
 
         if count < min_messages:
             return
@@ -343,7 +341,7 @@ class MemoryManager:
             return
 
         await self.update_memory(chat_id)
-        await asyncio.to_thread(self.db.set_meta, chat_id, "last_memory_update_message_count", count)
+        self.db.set_meta(chat_id, "last_memory_update_message_count", count)
 
     async def update_memory(self, chat_id: int) -> None:
         messages = self.db.recent_messages(chat_id, 120)
@@ -375,7 +373,6 @@ class MemoryManager:
             response = await self.client.chat.completions.create(
                 model=self.model,
                 temperature=0.2,
-                max_tokens=2500,
                 **extra_kw,
                 messages=[
                     {
@@ -399,11 +396,7 @@ class MemoryManager:
         content = response.choices[0].message.content or "{}"
         data = self._parse_json_object(content)
         if not data:
-            logger.warning(
-                "Memory update returned invalid JSON (finish_reason=%s), raw content (first 500 chars): %r",
-                getattr(response.choices[0], "finish_reason", "?") if response.choices else "?",
-                content[:500],
-            )
+            logger.warning("Memory update returned invalid JSON")
             return
 
         chat_memory = data.get("chat_memory")
@@ -445,35 +438,7 @@ class MemoryManager:
 
         try:
             obj = json.loads(cleaned)
-            return obj if isinstance(obj, dict) else {}
         except json.JSONDecodeError:
-            pass
+            return {}
 
-        # GLM/LLaMA occasionally emit trailing commas or get cut off by
-        # max_tokens before the closing braces. Try a couple of cheap
-        # repairs rather than discarding a mostly-valid object outright.
-        repaired = re.sub(r",\s*([}\]])", r"\1", cleaned)
-        try:
-            obj = json.loads(repaired)
-            return obj if isinstance(obj, dict) else {}
-        except json.JSONDecodeError:
-            pass
-
-        if start >= 0:
-            # Truncated mid-object: close off unbalanced brackets/quotes
-            # and retry. Best-effort — salvages whatever top-level keys
-            # were already complete before the cutoff.
-            truncated = cleaned if end >= start else text[start:]
-            truncated = re.sub(r",\s*$", "", truncated.rstrip())
-            open_braces = truncated.count("{") - truncated.count("}")
-            open_brackets = truncated.count("[") - truncated.count("]")
-            if truncated.count('"') % 2 != 0:
-                truncated += '"'
-            truncated += "]" * max(open_brackets, 0) + "}" * max(open_braces, 0)
-            try:
-                obj = json.loads(truncated)
-                return obj if isinstance(obj, dict) else {}
-            except json.JSONDecodeError:
-                pass
-
-        return {}
+        return obj if isinstance(obj, dict) else {}
