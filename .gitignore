@@ -17,3 +17,17 @@ venv/
 amvera_deploy.env
 amvera_speed.env
 amvera_*.png
+attached_assets/
+# LLM keys / tokens must never be committed (keep only *.example templates)
+.env
+.env.*
+!.env.example
+!.env.local.example
+!.env.proxy.example
+!.env.speed
+!.env.amvera
+# local DBs (use /data on Amvera, not repo)
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+*.db
