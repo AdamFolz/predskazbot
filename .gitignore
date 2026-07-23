@@ -28,3 +28,4 @@ Thumbs.db
 # --- Scratch ---
 inbox_tmp/
 tmp/
+amvera_deploy.env

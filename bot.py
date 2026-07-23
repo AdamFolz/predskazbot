@@ -1425,26 +1425,84 @@ async def execute_agent_tool(chat_id: int, user_id: int, tool_name: str, argumen
         return f"Ошибка при выполнении инструмента {tool_name}: {exc}"
 
 
+def _message_addresses_bot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """True if the user is talking to the bot (mention / name / slang / reply handled separately)."""
+    msg = update.message
+    if not msg or not msg.text:
+        return False
+
+    bot = context.bot
+    bot_username = (bot.username or "").lower()
+    bot_id = bot.id
+
+    # Proper Telegram entities (@username or text_mention)
+    for ent in msg.entities or []:
+        et = getattr(ent, "type", None)
+        et_val = getattr(et, "value", et)  # Enum or str
+        if et_val == "mention":
+            mention = msg.text[ent.offset : ent.offset + ent.length].lower()
+            if bot_username and mention == f"@{bot_username}":
+                return True
+        elif et_val == "text_mention":
+            if ent.user and ent.user.id == bot_id:
+                return True
+
+    text_lower = msg.text.lower()
+    # Common names / slang / display branding (HYEBOT, Сексялка, …)
+    trigger_words = [
+        "хуебот",
+        "хуёбот",
+        "hyebot",
+        "hye bot",
+        "сексялка",
+        "бафик",
+        "предсказалка",
+        "предсказбот",
+        "predskazbot",
+        "оракул",
+        "seksyalka",
+    ]
+    if bot_username:
+        trigger_words.append(f"@{bot_username}")
+        # bare username without @ (people type it)
+        trigger_words.append(bot_username)
+
+    # "бот" as a whole word / address — not inside other words
+    if re.search(r"(^|[\s,.:;!?«\"'(])бот([\s,.:;!?»\"')]|$)", text_lower):
+        return True
+
+    return any(w in text_lower for w in trigger_words)
+
+
 async def chat_participant_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message or not update.message.text:
         return
     chat_id = await resolve_target_chat_id(update)
     user_id = user_id_of(update)
 
-    if check_user_cooldown(participant_rate_limit, chat_id, user_id, 4) > 0:
+    participant_cd = int(os.getenv("PARTICIPANT_COOLDOWN_SECONDS", "3"))
+    if check_user_cooldown(participant_rate_limit, chat_id, user_id, participant_cd) > 0:
         return
 
     await context.bot.send_chat_action(chat_id=chat_id, action="typing")
     try:
-        await memory_manager.maybe_update_memory(chat_id)
-        chat_context = memory_manager.build_chat_context(chat_id, 25)
+        # Hot path: do NOT run memory curator here (already possibly run in store_message).
+        # Smaller context = much faster round-trip on glm/amvera.
+        ctx_msgs = int(os.getenv("PARTICIPANT_CONTEXT_MESSAGES", "20"))
+        chat_context = memory_manager.build_chat_context(chat_id, ctx_msgs)
         user_profile = memory_manager.build_context_for_user(chat_id, user_id, 5)
 
-        from utils import fetch_live_web_info
-        live_web = await fetch_live_web_info(update.message.text)
-        if live_web:
-            chat_context = safe_short(chat_context + "\n\nАКТУАЛЬНЫЕ ДАННЫЕ ИЗ ИНТЕРНЕТА (только что получено):\n" + live_web, 14000)
+        # Live web is optional and slow (wttr/ddg). Off by default on hot path.
+        if os.getenv("LIVE_WEB_ON_PARTICIPANT", "0") in ("1", "true", "True", "yes"):
+            from utils import fetch_live_web_info
+            live_web = await fetch_live_web_info(update.message.text)
+            if live_web:
+                chat_context = safe_short(
+                    chat_context + "\n\nАКТУАЛЬНЫЕ ДАННЫЕ ИЗ ИНТЕРНЕТА (только что получено):\n" + live_web,
+                    14000,
+                )
 
+        max_out = int(os.getenv("PARTICIPANT_MAX_TOKENS", "350"))
         msg_list = [
             {"role": "system", "content": CORE_STYLE_SYSTEM},
             {
@@ -1462,7 +1520,7 @@ async def chat_participant_reply(update: Update, context: ContextTypes.DEFAULT_T
             response = await openai_client.chat.completions.create(
                 model=OPENAI_MODEL,
                 temperature=0.8,
-                max_tokens=600,
+                max_tokens=max_out,
                 **({"tools": AGENT_TOOLS, "tool_choice": "auto"} if _supports_native_tools() else {}),
                 **_llm_kwargs(),
                 messages=msg_list,
@@ -1471,7 +1529,7 @@ async def chat_participant_reply(update: Update, context: ContextTypes.DEFAULT_T
             response = await openai_client.chat.completions.create(
                 model=OPENAI_MODEL,
                 temperature=0.8,
-                max_tokens=600,
+                max_tokens=max_out,
                 **_llm_kwargs(),
                 messages=msg_list,
             )
@@ -1491,7 +1549,7 @@ async def chat_participant_reply(update: Update, context: ContextTypes.DEFAULT_T
             response = await openai_client.chat.completions.create(
                 model=OPENAI_MODEL,
                 temperature=0.8,
-                max_tokens=600,
+                max_tokens=max_out,
                 **_llm_kwargs(),
                 messages=msg_list,
             )
@@ -1583,10 +1641,9 @@ async def store_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             return
 
     if v1_saved:
-        try:
-            await memory_manager.maybe_update_memory(chat_id)
-        except Exception:
-            logger.exception("Memory update failed")
+        # Memory curator is slow (extra LLM call). Never block a live reply on it —
+        # run after we decide whether to answer, and only when not about to reply.
+        pass
     elif not v2_saved:
         logger.warning("Message was not saved in either v1 or v2 storage")
 
@@ -1596,19 +1653,7 @@ async def store_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         and update.message.reply_to_message.from_user
         and update.message.reply_to_message.from_user.id == context.bot.id
     )
-    bot_username = context.bot.username or "predskazbot"
-    text_lower = text.lower()
-    trigger_words = [
-        "хуебот",
-        "сексялка",
-        "бафик",
-        "предсказалка",
-        f"@{bot_username.lower()}",
-        "бот,",
-        "бот ",
-        "оракул,",
-    ]
-    has_trigger = any(w in text_lower for w in trigger_words)
+    has_trigger = _message_addresses_bot(update, context)
 
     if chat.type == ChatType.PRIVATE:
         should_reply = True
@@ -1630,6 +1675,12 @@ async def store_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     if should_reply:
         await chat_participant_reply(update, context)
+    elif v1_saved:
+        # Background-ish: only curate memory when we are NOT answering right now.
+        try:
+            await memory_manager.maybe_update_memory(chat_id)
+        except Exception:
+            logger.exception("Memory update failed")
 
 
 def ensure_event_loop() -> None:
