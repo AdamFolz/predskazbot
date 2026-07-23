@@ -954,10 +954,13 @@ async def ask(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if knowledge_base.exists():
             kb_context = knowledge_base.build_context(build_kb_query(question, chat_context), limit=KB_SEARCH_LIMIT, max_chars=5000)
 
-        from utils import fetch_live_web_info
-        live_web = await fetch_live_web_info(question)
+        from web_search import live_web_context
+        live_web = await live_web_context(question, force=True)
         if live_web:
-            chat_context = safe_short(chat_context + "\n\nАКТУАЛЬНЫЕ ДАННЫЕ ИЗ ИНТЕРНЕТА (только что получено):\n" + live_web, 14000)
+            chat_context = safe_short(
+                chat_context + "\n\nАКТУАЛЬНЫЕ ДАННЫЕ ИЗ ИНТЕРНЕТА (только что получено):\n" + live_web,
+                14000,
+            )
     except Exception:
         logger.exception("Failed to build /ask context")
         await safe_send(update, "Не получилось собрать контекст. Попробуй позже.")
@@ -1419,8 +1422,8 @@ async def execute_agent_tool(chat_id: int, user_id: int, tool_name: str, argumen
             query = str(arguments.get("query", "")).strip()
             if not query:
                 return "Ошибка: пустой запрос."
-            from utils import fetch_live_web_info
-            res = await fetch_live_web_info(query)
+            from web_search import live_web_context
+            res = await live_web_context(query, force=True)
             return res or f"По запросу '{query}' в интернете свежих данных не получено."
 
         elif tool_name == "add_sacred_lore":
@@ -1531,10 +1534,23 @@ async def chat_participant_reply(update: Update, context: ContextTypes.DEFAULT_T
         chat_context = memory_manager.build_chat_context(chat_id, ctx_msgs)
         user_profile = memory_manager.build_context_for_user(chat_id, user_id, 5)
 
-        # Live web (wttr/ddg) is slow — off by default on mention path.
-        if os.getenv("LIVE_WEB_ON_PARTICIPANT", "0") in ("1", "true", "True", "yes"):
-            from utils import fetch_live_web_info
-            live_web = await fetch_live_web_info(update.message.text)
+        # Live web: on by intent (weather/курс/факт), or forced via env.
+        # LIVE_WEB_ON_PARTICIPANT=0 disables; =1 always tries; default=auto.
+        _lw_mode = os.getenv("LIVE_WEB_ON_PARTICIPANT", "auto").strip().lower()
+        _want_web = False
+        if _lw_mode in ("1", "true", "yes", "on"):
+            _want_web = True
+        elif _lw_mode in ("0", "false", "no", "off"):
+            _want_web = False
+        else:
+            try:
+                from web_search import needs_live_web
+                _want_web = needs_live_web(update.message.text)
+            except Exception:
+                _want_web = False
+        if _want_web:
+            from web_search import live_web_context
+            live_web = await live_web_context(update.message.text, force=False)
             if live_web:
                 chat_context = safe_short(
                     chat_context + "\n\nАКТУАЛЬНЫЕ ДАННЫЕ ИЗ ИНТЕРНЕТА (только что получено):\n" + live_web,
@@ -1854,18 +1870,13 @@ def main() -> None:
         pool_timeout=pool_t,
     )
 
+    # Timeouts live ONLY on HTTPXRequest instances — PTB forbids mixing
+    # .request(...) with builder .connect_timeout()/.read_timeout()/etc.
     app = (
         Application.builder()
         .token(TELEGRAM_BOT_TOKEN)
         .request(request)
         .get_updates_request(get_updates_request)
-        .connect_timeout(connect_t)
-        .read_timeout(read_t)
-        .write_timeout(write_t)
-        .pool_timeout(pool_t)
-        .get_updates_connect_timeout(connect_t)
-        .get_updates_read_timeout(updates_read_t)
-        .get_updates_pool_timeout(pool_t)
         .post_init(post_init)
         .build()
     )
