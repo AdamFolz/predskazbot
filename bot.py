@@ -12,8 +12,9 @@ from dotenv import load_dotenv
 from openai import AsyncOpenAI, AuthenticationError
 from telegram import Update
 from telegram.constants import ChatType
-from telegram.error import BadRequest, Forbidden, RetryAfter, TimedOut
+from telegram.error import BadRequest, Forbidden, RetryAfter, TimedOut, NetworkError
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram.request import HTTPXRequest
 
 from database import Database
 from knowledge_base import KnowledgeBase
@@ -30,6 +31,43 @@ logging.basicConfig(
 )
 
 logger = logging.getLogger("predskazbot")
+
+# Persist /set_style choice under Amvera /data (ephemeral FS otherwise).
+_STYLE_STATE_PATH = Path("/data/style_choice.txt") if Path("/data").exists() else Path("style_choice.txt")
+_STYLE_MODULES = {
+    "unrestricted": "prompts_v3_unrestricted",
+    "toxic3": "prompts_v3_unrestricted",
+    "smart": "prompts_smart",
+    "bro": "prompts_smart",
+    "toxic": "prompts_v2_toxic",
+    "toxic2": "prompts_v2_toxic",
+    "clean": "prompts_v2_2",
+    "v2": "prompts_v2_2",
+}
+
+
+def _apply_style_module(module_name: str) -> None:
+    """Hot-reload a prompt preset module into process globals (no file copy)."""
+    global CORE_STYLE_SYSTEM, FUTURE_PROMPT, SUMMARY_PROMPT, ASK_PROMPT, KB_ANSWER_PROMPT, PARTICIPANT_PROMPT
+    import importlib
+
+    preset = importlib.import_module(module_name)
+    importlib.reload(preset)
+    CORE_STYLE_SYSTEM = preset.CORE_STYLE_SYSTEM
+    FUTURE_PROMPT = preset.FUTURE_PROMPT
+    SUMMARY_PROMPT = preset.SUMMARY_PROMPT
+    ASK_PROMPT = preset.ASK_PROMPT
+    KB_ANSWER_PROMPT = preset.KB_ANSWER_PROMPT
+    PARTICIPANT_PROMPT = preset.PARTICIPANT_PROMPT
+
+
+try:
+    if _STYLE_STATE_PATH.exists():
+        _saved = _STYLE_STATE_PATH.read_text(encoding="utf-8").strip()
+        if _saved:
+            _apply_style_module(_saved)
+except Exception:
+    pass  # never block startup on style restore
 
 # --- Unified config v2.1 ---
 try:
@@ -245,19 +283,37 @@ async def safe_send(update: Update, text: str, max_len: int = 3500) -> None:
         return
 
     payload = safe_short(text, max_len)
-    try:
-        await chat.send_message(payload)
-    except RetryAfter as exc:
-        logger.warning("Telegram rate limit hit: retry_after=%s, retrying after sleep...", exc.retry_after)
+    last_err: Exception | None = None
+    for attempt in range(1, 4):
         try:
-            await asyncio.sleep(float(exc.retry_after))
             await chat.send_message(payload)
-        except Exception:
-            logger.exception("Failed to send Telegram message after RetryAfter")
-    except (BadRequest, Forbidden, TimedOut):
-        logger.exception("Failed to send Telegram message")
-    except Exception:
-        logger.exception("Unexpected Telegram send failure")
+            return
+        except RetryAfter as exc:
+            last_err = exc
+            logger.warning(
+                "Telegram rate limit: retry_after=%s (attempt %s/3)",
+                exc.retry_after,
+                attempt,
+            )
+            await asyncio.sleep(float(exc.retry_after) + 0.5)
+        except (TimedOut, NetworkError) as exc:
+            last_err = exc
+            wait = min(2 ** attempt, 12)
+            logger.warning(
+                "Telegram network/timeout on send (attempt %s/3), sleep %ss: %s",
+                attempt,
+                wait,
+                exc,
+            )
+            await asyncio.sleep(wait)
+        except (BadRequest, Forbidden) as exc:
+            logger.exception("Failed to send Telegram message (non-retryable): %s", exc)
+            return
+        except Exception as exc:
+            last_err = exc
+            logger.exception("Unexpected Telegram send failure")
+            return
+    logger.error("safe_send gave up after retries: %s", last_err)
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1161,43 +1217,33 @@ async def set_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def set_style(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Admin command to switch prompt presets on the fly and hot-reload in memory."""
-    global CORE_STYLE_SYSTEM, FUTURE_PROMPT, SUMMARY_PROMPT, ASK_PROMPT, KB_ANSWER_PROMPT, PARTICIPANT_PROMPT
+    """Admin command to switch prompt presets on the fly and hot-reload in memory.
+
+    Never copies over prompts.py (Amvera wipes non-/data files on rebuild).
+    Persists choice under /data/style_choice.txt.
+    """
     if not update.message or not await ensure_allowed_chat(update) or not is_admin(update):
         return
     if not context.args:
         await safe_send(update, "Использование: /set_style [unrestricted / smart / toxic / clean]")
         return
     style = context.args[0].lower().strip()
-    source_file = ""
-    if style in ("unrestricted", "toxic3"):
-        source_file = "prompts_v3_unrestricted.py"
-    elif style in ("smart", "bro"):
-        source_file = "prompts_smart.py"
-    elif style in ("toxic", "toxic2"):
-        source_file = "prompts_v2_toxic.py"
-    elif style in ("clean", "v2"):
-        source_file = "prompts_v2_2.py"
-    else:
+    module_name = _STYLE_MODULES.get(style)
+    if not module_name:
         await safe_send(update, "❌ Неизвестный стиль. Выбери из: unrestricted / smart / toxic / clean")
         return
 
-    p = Path(source_file)
-    if not p.exists():
-        await safe_send(update, f"❌ Файл пресета {source_file} не найден на сервере.")
-        return
-
     try:
-        import shutil, importlib, prompts
-        shutil.copy(p, "prompts.py")
-        importlib.reload(prompts)
-        CORE_STYLE_SYSTEM = prompts.CORE_STYLE_SYSTEM
-        FUTURE_PROMPT = prompts.FUTURE_PROMPT
-        SUMMARY_PROMPT = prompts.SUMMARY_PROMPT
-        ASK_PROMPT = prompts.ASK_PROMPT
-        KB_ANSWER_PROMPT = prompts.KB_ANSWER_PROMPT
-        PARTICIPANT_PROMPT = prompts.PARTICIPANT_PROMPT
-        await safe_send(update, f"✅ Стиль успешно переключён на {style} ({source_file}) и горячо перезагружен в памяти!")
+        _apply_style_module(module_name)
+        try:
+            _STYLE_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+            _STYLE_STATE_PATH.write_text(module_name, encoding="utf-8")
+        except Exception:
+            logger.exception("Failed to persist style choice to %s", _STYLE_STATE_PATH)
+        await safe_send(
+            update,
+            f"✅ Стиль успешно переключён на {style} ({module_name}) и горячо перезагружен в памяти!",
+        )
     except Exception as exc:
         await safe_send(update, f"❌ Ошибка переключения стиля: {exc}")
 
@@ -1785,7 +1831,44 @@ def main() -> None:
     db.init()
     auto_import_json_on_startup()
 
-    app = Application.builder().token(TELEGRAM_BOT_TOKEN).post_init(post_init).build()
+    # Amvera Moscow often has flaky paths to api.telegram.org — raise timeouts
+    # and use a separate long-poll client so getUpdates doesn't die on 5s default.
+    connect_t = float(os.getenv("TELEGRAM_CONNECT_TIMEOUT", "30"))
+    read_t = float(os.getenv("TELEGRAM_READ_TIMEOUT", "30"))
+    write_t = float(os.getenv("TELEGRAM_WRITE_TIMEOUT", "30"))
+    pool_t = float(os.getenv("TELEGRAM_POOL_TIMEOUT", "30"))
+    updates_read_t = float(os.getenv("TELEGRAM_GET_UPDATES_READ_TIMEOUT", "45"))
+
+    request = HTTPXRequest(
+        connection_pool_size=8,
+        connect_timeout=connect_t,
+        read_timeout=read_t,
+        write_timeout=write_t,
+        pool_timeout=pool_t,
+    )
+    get_updates_request = HTTPXRequest(
+        connection_pool_size=4,
+        connect_timeout=connect_t,
+        read_timeout=updates_read_t,
+        write_timeout=write_t,
+        pool_timeout=pool_t,
+    )
+
+    app = (
+        Application.builder()
+        .token(TELEGRAM_BOT_TOKEN)
+        .request(request)
+        .get_updates_request(get_updates_request)
+        .connect_timeout(connect_t)
+        .read_timeout(read_t)
+        .write_timeout(write_t)
+        .pool_timeout(pool_t)
+        .get_updates_connect_timeout(connect_t)
+        .get_updates_read_timeout(updates_read_t)
+        .get_updates_pool_timeout(pool_t)
+        .post_init(post_init)
+        .build()
+    )
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
@@ -1815,7 +1898,34 @@ def main() -> None:
 
     mode = "v2-full" if memory_manager.v2_full_transition else "bridge"
     logger.info("PredskazBot started with v2 mode=%s", mode)
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+    # Retry loop: Amvera↔Telegram connect timeouts must not leave the process dead.
+    max_start_attempts = int(os.getenv("TELEGRAM_START_RETRIES", "0"))  # 0 = forever
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            app.run_polling(
+                allowed_updates=Update.ALL_TYPES,
+                drop_pending_updates=False,
+                close_loop=False,
+            )
+            break
+        except (TimedOut, NetworkError) as exc:
+            logger.error(
+                "Telegram start/poll timed out (attempt %s): %s — retry in %ss",
+                attempt,
+                exc,
+                min(5 * attempt, 60),
+            )
+            if max_start_attempts and attempt >= max_start_attempts:
+                raise
+            time.sleep(min(5 * attempt, 60))
+        except Exception:
+            logger.exception("run_polling crashed (attempt %s) — retry in 15s", attempt)
+            if max_start_attempts and attempt >= max_start_attempts:
+                raise
+            time.sleep(15)
 
 
 if __name__ == "__main__":
