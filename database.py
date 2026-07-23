@@ -1,0 +1,671 @@
+import json
+import sqlite3
+from contextlib import contextmanager
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Iterable, Optional
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+class Database:
+    def __init__(self, path: str) -> None:
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+
+    @contextmanager
+    def connect(self):
+        conn = sqlite3.connect(self.path)
+        conn.row_factory = sqlite3.Row
+        try:
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def init(self) -> None:
+        with self.connect() as conn:
+            conn.executescript(
+                '''
+                PRAGMA journal_mode=WAL;
+
+                CREATE TABLE IF NOT EXISTS users (
+                    chat_id INTEGER NOT NULL,
+                    user_id INTEGER NOT NULL,
+                    username TEXT NOT NULL DEFAULT '',
+                    display_name TEXT NOT NULL DEFAULT '',
+                    first_seen TEXT NOT NULL,
+                    last_seen TEXT NOT NULL,
+                    PRIMARY KEY (chat_id, user_id)
+                );
+
+                CREATE TABLE IF NOT EXISTS raw_messages (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    chat_id INTEGER NOT NULL,
+                    user_id INTEGER NOT NULL,
+                    username TEXT NOT NULL DEFAULT '',
+                    display_name TEXT NOT NULL DEFAULT '',
+                    text TEXT NOT NULL,
+                    mentions_json TEXT NOT NULL DEFAULT '[]',
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_raw_messages_chat_id_id
+                ON raw_messages(chat_id, id);
+
+                CREATE INDEX IF NOT EXISTS idx_raw_messages_chat_user
+                ON raw_messages(chat_id, user_id, id);
+
+                CREATE TABLE IF NOT EXISTS user_profiles (
+                    chat_id INTEGER NOT NULL,
+                    user_id INTEGER NOT NULL,
+                    username TEXT NOT NULL DEFAULT '',
+                    display_name TEXT NOT NULL DEFAULT '',
+                    style_summary TEXT NOT NULL DEFAULT '',
+                    frequent_topics TEXT NOT NULL DEFAULT '',
+                    mentioned_users TEXT NOT NULL DEFAULT '',
+                    relationship_notes TEXT NOT NULL DEFAULT '',
+                    personal_memes TEXT NOT NULL DEFAULT '',
+                    soft_labels TEXT NOT NULL DEFAULT '',
+                    energy_level INTEGER NOT NULL DEFAULT 1,
+                    toxicity_style TEXT NOT NULL DEFAULT '',
+                    meme_score INTEGER NOT NULL DEFAULT 1,
+                    night_mode_behavior TEXT NOT NULL DEFAULT '',
+                    confidence_score REAL NOT NULL DEFAULT 0.0,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (chat_id, user_id)
+                );
+
+                CREATE TABLE IF NOT EXISTS chat_memory (
+                    chat_id INTEGER PRIMARY KEY,
+                    mood_today TEXT NOT NULL DEFAULT '',
+                    chaos_level INTEGER NOT NULL DEFAULT 1,
+                    main_topic_today TEXT NOT NULL DEFAULT '',
+                    main_clown_today TEXT NOT NULL DEFAULT '',
+                    meme_of_the_day TEXT NOT NULL DEFAULT '',
+                    weekly_memes TEXT NOT NULL DEFAULT '',
+                    recent_drama TEXT NOT NULL DEFAULT '',
+                    popular_topics TEXT NOT NULL DEFAULT '',
+                    local_phrases TEXT NOT NULL DEFAULT '',
+                    sacred_artifacts TEXT NOT NULL DEFAULT '',
+                    chat_mythology TEXT NOT NULL DEFAULT '',
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS relationships (
+                    chat_id INTEGER NOT NULL,
+                    user_a_id INTEGER NOT NULL,
+                    user_b_id INTEGER NOT NULL,
+                    relation_type TEXT NOT NULL DEFAULT '',
+                    notes TEXT NOT NULL DEFAULT '',
+                    evidence_count INTEGER NOT NULL DEFAULT 0,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (chat_id, user_a_id, user_b_id, relation_type)
+                );
+
+                CREATE TABLE IF NOT EXISTS bot_responses (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    chat_id INTEGER NOT NULL,
+                    user_id INTEGER,
+                    command TEXT NOT NULL,
+                    response_text TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_bot_responses_chat_id_id
+                ON bot_responses(chat_id, id);
+
+                CREATE TABLE IF NOT EXISTS manual_memories (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    chat_id INTEGER NOT NULL,
+                    author_user_id INTEGER NOT NULL,
+                    text TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS meta (
+                    chat_id INTEGER NOT NULL,
+                    key TEXT NOT NULL,
+                    value TEXT NOT NULL,
+                    PRIMARY KEY (chat_id, key)
+                );
+
+                CREATE TABLE IF NOT EXISTS audit_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    chat_id INTEGER NOT NULL,
+                    actor_user_id INTEGER NOT NULL,
+                    action TEXT NOT NULL,
+                    target_user_id INTEGER,
+                    details_json TEXT NOT NULL DEFAULT '{}',
+                    created_at TEXT NOT NULL
+                );
+                '''
+            )
+
+    def upsert_user(self, chat_id: int, user_id: int, username: str, display_name: str) -> None:
+        now = utc_now()
+        with self.connect() as conn:
+            conn.execute(
+                '''
+                INSERT INTO users(chat_id, user_id, username, display_name, first_seen, last_seen)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(chat_id, user_id) DO UPDATE SET
+                    username=excluded.username,
+                    display_name=excluded.display_name,
+                    last_seen=excluded.last_seen
+                ''',
+                (chat_id, user_id, username, display_name, now, now),
+            )
+
+    def add_message(self, chat_id: int, user_id: int, username: str, display_name: str, text: str, mentions: list[str]) -> None:
+        now = utc_now()
+        with self.connect() as conn:
+            conn.execute(
+                '''
+                INSERT INTO users(chat_id, user_id, username, display_name, first_seen, last_seen)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(chat_id, user_id) DO UPDATE SET
+                    username=excluded.username,
+                    display_name=excluded.display_name,
+                    last_seen=excluded.last_seen
+                ''',
+                (chat_id, user_id, username, display_name, now, now),
+            )
+            conn.execute(
+                '''
+                INSERT INTO raw_messages(chat_id, user_id, username, display_name, text, mentions_json, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ''',
+                (chat_id, user_id, username, display_name, text, json.dumps(mentions, ensure_ascii=False), now),
+            )
+
+    def recent_messages(self, chat_id: int, limit: int = 80) -> list[sqlite3.Row]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                '''
+                SELECT * FROM raw_messages
+                WHERE chat_id = ?
+                ORDER BY id DESC
+                LIMIT ?
+                ''',
+                (chat_id, limit),
+            ).fetchall()
+        return list(reversed(rows))
+
+    def recent_dialogue(self, chat_id: int, limit: int = 40) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            user_rows = conn.execute(
+                '''
+                SELECT created_at, display_name, text, 'user' as source
+                FROM raw_messages
+                WHERE chat_id = ?
+                ORDER BY id DESC
+                LIMIT ?
+                ''',
+                (chat_id, limit),
+            ).fetchall()
+            bot_rows = conn.execute(
+                '''
+                SELECT created_at, 'SEKSYALKA_PREDSKAZALKA_BOT [ТЫ]' as display_name, response_text as text, 'bot' as source
+                FROM bot_responses
+                WHERE chat_id = ?
+                ORDER BY id DESC
+                LIMIT ?
+                ''',
+                (chat_id, limit),
+            ).fetchall()
+        combined = [dict(row) for row in user_rows + bot_rows]
+        combined.sort(key=lambda x: str(x.get("created_at", "")))
+        return combined[-limit:]
+
+    def _chat_filter_clause(self, chat_id: int) -> tuple[str, list[Any]]:
+        if chat_id < 0:
+            return "chat_id = ?", [chat_id]
+        return "chat_id IN (?, (SELECT chat_id FROM raw_messages WHERE chat_id < 0 GROUP BY chat_id ORDER BY COUNT(*) DESC LIMIT 1))", [chat_id]
+
+    def search_history_messages(self, chat_id: int, query: str, username: Optional[str] = None, limit: int = 10) -> list[dict[str, Any]]:
+        try:
+            query_esc = query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            c_clause, params = self._chat_filter_clause(chat_id)
+            with self.connect() as conn:
+                q_sql = f"""
+                    SELECT created_at, display_name, username, text
+                    FROM raw_messages
+                    WHERE {c_clause} AND text LIKE ? ESCAPE '\\'
+                """
+                params.append(f"%{query_esc}%")
+                if username:
+                    q_sql += " AND (lower(username) = ? OR lower(display_name) LIKE ?)"
+                    u_clean = username.lstrip("@").lower()
+                    params.extend([u_clean, f"%{u_clean}%"])
+                q_sql += " ORDER BY id DESC LIMIT ?"
+                params.append(limit)
+                rows = conn.execute(q_sql, params).fetchall()
+            return [dict(row) for row in rows]
+        except Exception:
+            return []
+
+    def get_user_full_statistics(self, chat_id: int, username: str) -> dict[str, Any]:
+        try:
+            u_clean = username.lstrip("@").lower()
+            c_clause, params = self._chat_filter_clause(chat_id)
+            with self.connect() as conn:
+                u_row = conn.execute(
+                    f"""
+                    SELECT * FROM users
+                    WHERE {c_clause} AND (lower(username) = ? OR lower(display_name) LIKE ?)
+                    LIMIT 1
+                    """,
+                    (*params, u_clean, f"%{u_clean}%")
+                ).fetchone()
+                if not u_row:
+                    return {}
+                uid = u_row["user_id"]
+                cnt = conn.execute(
+                    f"SELECT COUNT(*) as c FROM raw_messages WHERE {c_clause} AND user_id = ?",
+                    (*params, uid)
+                ).fetchone()
+                msg_count = cnt["c"] if cnt else 0
+                return {
+                    "user_id": uid,
+                    "display_name": u_row["display_name"],
+                    "username": u_row["username"],
+                    "first_seen": u_row["first_seen"],
+                    "last_seen": u_row["last_seen"],
+                    "total_messages": msg_count,
+                }
+        except Exception:
+            return {}
+
+    def get_primary_group_chat_id(self) -> Optional[int]:
+        try:
+            with self.connect() as conn:
+                row = conn.execute(
+                    """
+                    SELECT chat_id FROM raw_messages
+                    WHERE chat_id < 0
+                    GROUP BY chat_id
+                    ORDER BY COUNT(*) DESC
+                    LIMIT 1
+                    """
+                ).fetchone()
+                if row:
+                    return int(row["chat_id"])
+        except Exception:
+            pass
+        return None
+
+    def get_largest_chat_id(self, fallback_id: int) -> int:
+        try:
+            with self.connect() as conn:
+                cnt = conn.execute("SELECT COUNT(*) FROM raw_messages WHERE chat_id = ?", (fallback_id,)).fetchone()
+                if cnt and cnt[0] > 100:
+                    return fallback_id
+                row = conn.execute("SELECT chat_id FROM raw_messages GROUP BY chat_id ORDER BY COUNT(*) DESC LIMIT 1").fetchone()
+                if row and row["chat_id"]:
+                    return int(row["chat_id"])
+        except Exception:
+            pass
+        return fallback_id
+
+    def recent_user_messages(self, chat_id: int, user_id: int, limit: int = 30) -> list[sqlite3.Row]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                '''
+                SELECT * FROM raw_messages
+                WHERE chat_id = ? AND user_id = ?
+                ORDER BY id DESC
+                LIMIT ?
+                ''',
+                (chat_id, user_id, limit),
+            ).fetchall()
+        return list(reversed(rows))
+
+    def get_user_by_username(self, chat_id: int, username: str) -> Optional[sqlite3.Row]:
+        username = username.lstrip("@").lower()
+        with self.connect() as conn:
+            return conn.execute(
+                '''
+                SELECT * FROM users
+                WHERE chat_id = ? AND lower(username) = ?
+                ''',
+                (chat_id, username),
+            ).fetchone()
+
+    def get_user_profile(self, chat_id: int, user_id: int) -> Optional[sqlite3.Row]:
+        with self.connect() as conn:
+            return conn.execute(
+                'SELECT * FROM user_profiles WHERE chat_id = ? AND user_id = ?',
+                (chat_id, user_id),
+            ).fetchone()
+
+    def upsert_user_profile(self, chat_id: int, profile: dict[str, Any]) -> None:
+        now = utc_now()
+        with self.connect() as conn:
+            conn.execute(
+                '''
+                INSERT INTO user_profiles(
+                    chat_id, user_id, username, display_name, style_summary,
+                    frequent_topics, mentioned_users, relationship_notes, personal_memes,
+                    soft_labels, energy_level, toxicity_style, meme_score,
+                    night_mode_behavior, confidence_score, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(chat_id, user_id) DO UPDATE SET
+                    username=excluded.username,
+                    display_name=excluded.display_name,
+                    style_summary=excluded.style_summary,
+                    frequent_topics=excluded.frequent_topics,
+                    mentioned_users=excluded.mentioned_users,
+                    relationship_notes=excluded.relationship_notes,
+                    personal_memes=excluded.personal_memes,
+                    soft_labels=excluded.soft_labels,
+                    energy_level=excluded.energy_level,
+                    toxicity_style=excluded.toxicity_style,
+                    meme_score=excluded.meme_score,
+                    night_mode_behavior=excluded.night_mode_behavior,
+                    confidence_score=excluded.confidence_score,
+                    updated_at=excluded.updated_at
+                ''',
+                (
+                    chat_id,
+                    int(profile.get("user_id", 0)),
+                    str(profile.get("username", "")),
+                    str(profile.get("display_name", "")),
+                    str(profile.get("style_summary", "")),
+                    str(profile.get("frequent_topics", "")),
+                    str(profile.get("mentioned_users", "")),
+                    str(profile.get("relationship_notes", "")),
+                    str(profile.get("personal_memes", "")),
+                    str(profile.get("soft_labels", "")),
+                    int(profile.get("energy_level", 1)),
+                    str(profile.get("toxicity_style", "")),
+                    int(profile.get("meme_score", 1)),
+                    str(profile.get("night_mode_behavior", "")),
+                    float(profile.get("confidence_score", 0.0)),
+                    now,
+                ),
+            )
+
+    def get_chat_memory(self, chat_id: int) -> Optional[sqlite3.Row]:
+        with self.connect() as conn:
+            return conn.execute('SELECT * FROM chat_memory WHERE chat_id = ?', (chat_id,)).fetchone()
+
+    def upsert_chat_memory(self, chat_id: int, memory: dict[str, Any]) -> None:
+        now = utc_now()
+        with self.connect() as conn:
+            conn.execute(
+                '''
+                INSERT INTO chat_memory(
+                    chat_id, mood_today, chaos_level, main_topic_today, main_clown_today,
+                    meme_of_the_day, weekly_memes, recent_drama, popular_topics,
+                    local_phrases, sacred_artifacts, chat_mythology, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(chat_id) DO UPDATE SET
+                    mood_today=excluded.mood_today,
+                    chaos_level=excluded.chaos_level,
+                    main_topic_today=excluded.main_topic_today,
+                    main_clown_today=excluded.main_clown_today,
+                    meme_of_the_day=excluded.meme_of_the_day,
+                    weekly_memes=excluded.weekly_memes,
+                    recent_drama=excluded.recent_drama,
+                    popular_topics=excluded.popular_topics,
+                    local_phrases=excluded.local_phrases,
+                    sacred_artifacts=excluded.sacred_artifacts,
+                    chat_mythology=excluded.chat_mythology,
+                    updated_at=excluded.updated_at
+                ''',
+                (
+                    chat_id,
+                    str(memory.get("mood_today", "")),
+                    int(memory.get("chaos_level", 1)),
+                    str(memory.get("main_topic_today", "")),
+                    str(memory.get("main_clown_today", "")),
+                    str(memory.get("meme_of_the_day", "")),
+                    str(memory.get("weekly_memes", "")),
+                    str(memory.get("recent_drama", "")),
+                    str(memory.get("popular_topics", "")),
+                    str(memory.get("local_phrases", "")),
+                    str(memory.get("sacred_artifacts", "")),
+                    str(memory.get("chat_mythology", "")),
+                    now,
+                ),
+            )
+
+    def upsert_relationship(self, chat_id: int, relation: dict[str, Any]) -> None:
+        a = int(relation.get("user_a_id", 0))
+        b = int(relation.get("user_b_id", 0))
+        if not a or not b or a == b:
+            return
+        if a > b:
+            a, b = b, a
+        now = utc_now()
+        with self.connect() as conn:
+            conn.execute(
+                '''
+                INSERT INTO relationships(chat_id, user_a_id, user_b_id, relation_type, notes, evidence_count, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(chat_id, user_a_id, user_b_id, relation_type) DO UPDATE SET
+                    notes=excluded.notes,
+                    evidence_count=relationships.evidence_count + excluded.evidence_count,
+                    updated_at=excluded.updated_at
+                ''',
+                (
+                    chat_id,
+                    a,
+                    b,
+                    str(relation.get("relation_type", "")),
+                    str(relation.get("notes", "")),
+                    int(relation.get("evidence_count", 1)),
+                    now,
+                ),
+            )
+
+    def recent_relationships_for_user(self, chat_id: int, user_id: int, limit: int = 20) -> list[sqlite3.Row]:
+        with self.connect() as conn:
+            return conn.execute(
+                '''
+                SELECT * FROM relationships
+                WHERE chat_id = ? AND (user_a_id = ? OR user_b_id = ?)
+                ORDER BY updated_at DESC
+                LIMIT ?
+                ''',
+                (chat_id, user_id, user_id, limit),
+            ).fetchall()
+
+    def add_bot_response(self, chat_id: int, user_id: Optional[int], command: str, response_text: str) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                '''
+                INSERT INTO bot_responses(chat_id, user_id, command, response_text, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                ''',
+                (chat_id, user_id, command, response_text, utc_now()),
+            )
+
+    def recent_bot_responses(self, chat_id: int, limit: int = 80) -> list[str]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                '''
+                SELECT response_text FROM bot_responses
+                WHERE chat_id = ?
+                ORDER BY id DESC
+                LIMIT ?
+                ''',
+                (chat_id, limit),
+            ).fetchall()
+        return [str(row["response_text"]) for row in rows]
+
+    def add_manual_memory(self, chat_id: int, author_user_id: int, text: str) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                '''
+                INSERT INTO manual_memories(chat_id, author_user_id, text, created_at)
+                VALUES (?, ?, ?, ?)
+                ''',
+                (chat_id, author_user_id, text, utc_now()),
+            )
+
+    def recent_manual_memories(self, chat_id: int, limit: int = 30) -> list[sqlite3.Row]:
+        with self.connect() as conn:
+            return conn.execute(
+                '''
+                SELECT * FROM manual_memories
+                WHERE chat_id = ?
+                ORDER BY id DESC
+                LIMIT ?
+                ''',
+                (chat_id, limit),
+            ).fetchall()
+
+    def get_meta_int(self, chat_id: int, key: str, default: int = 0) -> int:
+        with self.connect() as conn:
+            row = conn.execute(
+                'SELECT value FROM meta WHERE chat_id = ? AND key = ?',
+                (chat_id, key),
+            ).fetchone()
+        if not row:
+            return default
+        try:
+            return int(row["value"])
+        except (ValueError, TypeError):
+            return default
+
+    def set_meta(self, chat_id: int, key: str, value: str | int) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                '''
+                INSERT INTO meta(chat_id, key, value)
+                VALUES (?, ?, ?)
+                ON CONFLICT(chat_id, key) DO UPDATE SET value=excluded.value
+                ''',
+                (chat_id, key, str(value)),
+            )
+
+    def count_messages(self, chat_id: int) -> int:
+        try:
+            with self.connect() as conn:
+                row = conn.execute(
+                    'SELECT COUNT(*) AS c FROM raw_messages WHERE chat_id = ?',
+                    (chat_id,),
+                ).fetchone()
+            return int(row["c"])
+        except Exception:
+            return 0
+
+    def count_users(self, chat_id: int) -> int:
+        try:
+            with self.connect() as conn:
+                row = conn.execute(
+                    'SELECT COUNT(*) AS c FROM users WHERE chat_id = ?',
+                    (chat_id,),
+                ).fetchone()
+            return int(row["c"])
+        except Exception:
+            return 0
+
+    def count_manual_memories(self, chat_id: int) -> int:
+        try:
+            with self.connect() as conn:
+                row = conn.execute(
+                    'SELECT COUNT(*) AS c FROM manual_memories WHERE chat_id = ?',
+                    (chat_id,),
+                ).fetchone()
+            return int(row["c"])
+        except Exception:
+            return 0
+
+    def add_audit_log(
+        self,
+        chat_id: int,
+        actor_user_id: int,
+        action: str,
+        target_user_id: int | None = None,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                '''
+                INSERT INTO audit_log(chat_id, actor_user_id, action, target_user_id, details_json, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ''',
+                (
+                    chat_id,
+                    actor_user_id,
+                    action,
+                    target_user_id,
+                    json.dumps(details or {}, ensure_ascii=False),
+                    utc_now(),
+                ),
+            )
+
+    def export_user_data(self, chat_id: int, user_id: int) -> dict[str, Any]:
+        with self.connect() as conn:
+            user = conn.execute(
+                'SELECT * FROM users WHERE chat_id = ? AND user_id = ?',
+                (chat_id, user_id),
+            ).fetchone()
+            messages = conn.execute(
+                'SELECT * FROM raw_messages WHERE chat_id = ? AND user_id = ? ORDER BY id ASC',
+                (chat_id, user_id),
+            ).fetchall()
+            profile = conn.execute(
+                'SELECT * FROM user_profiles WHERE chat_id = ? AND user_id = ?',
+                (chat_id, user_id),
+            ).fetchone()
+            relationships = conn.execute(
+                '''
+                SELECT * FROM relationships
+                WHERE chat_id = ? AND (user_a_id = ? OR user_b_id = ?)
+                ORDER BY updated_at ASC
+                ''',
+                (chat_id, user_id, user_id),
+            ).fetchall()
+            manual_memories = conn.execute(
+                'SELECT * FROM manual_memories WHERE chat_id = ? AND author_user_id = ? ORDER BY id ASC',
+                (chat_id, user_id),
+            ).fetchall()
+            bot_responses = conn.execute(
+                'SELECT * FROM bot_responses WHERE chat_id = ? AND user_id = ? ORDER BY id ASC',
+                (chat_id, user_id),
+            ).fetchall()
+
+        return {
+            "chat_id": chat_id,
+            "user_id": user_id,
+            "user": dict(user) if user else None,
+            "messages": [dict(row) for row in messages],
+            "profile": dict(profile) if profile else None,
+            "relationships": [dict(row) for row in relationships],
+            "manual_memories": [dict(row) for row in manual_memories],
+            "bot_responses": [dict(row) for row in bot_responses],
+        }
+
+    def delete_user_data(self, chat_id: int, user_id: int) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        with self.connect() as conn:
+            for table, where_sql, params in [
+                ("raw_messages", "chat_id = ? AND user_id = ?", (chat_id, user_id)),
+                ("user_profiles", "chat_id = ? AND user_id = ?", (chat_id, user_id)),
+                ("relationships", "chat_id = ? AND (user_a_id = ? OR user_b_id = ?)", (chat_id, user_id, user_id)),
+                ("manual_memories", "chat_id = ? AND author_user_id = ?", (chat_id, user_id)),
+                ("bot_responses", "chat_id = ? AND user_id = ?", (chat_id, user_id)),
+                ("users", "chat_id = ? AND user_id = ?", (chat_id, user_id)),
+            ]:
+                cur = conn.execute(f"DELETE FROM {table} WHERE {where_sql}", params)
+                counts[table] = int(cur.rowcount if cur.rowcount is not None else 0)
+        return counts
+
+    def forget_manual_memory(self, chat_id: int, memory_id: int) -> bool:
+        with self.connect() as conn:
+            cur = conn.execute(
+                'DELETE FROM manual_memories WHERE chat_id = ? AND id = ?',
+                (chat_id, memory_id),
+            )
+        return bool(cur.rowcount)
