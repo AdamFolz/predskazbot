@@ -151,6 +151,32 @@ def _llm_kwargs(extra: dict | None = None) -> dict:
         base.update(extra)
     return {"extra_body": base} if base else {}
 
+
+def extract_llm_text(response, fallback: str = "") -> str:
+    """Pull text out of an OpenAI-style completion, tolerant of GLM-5.1 quirks.
+
+    GLM/Amvera sometimes returns content in `reasoning_content` or an empty
+    `content`, which previously produced blank replies ("Оракул завис").
+    """
+    try:
+        msg = response.choices[0].message
+    except (AttributeError, IndexError, TypeError):
+        return fallback
+    content = getattr(msg, "content", None)
+    if content and str(content).strip():
+        return str(content)
+    # GLM reasoning-style fallback
+    reason = getattr(msg, "reasoning_content", None)
+    if reason and str(reason).strip():
+        return str(reason)
+    # Some providers nest a `model_extra` dict
+    extra = getattr(msg, "model_extra", None) or {}
+    for key in ("reasoning_content", "reasoning", "text"):
+        val = extra.get(key) if isinstance(extra, dict) else None
+        if val and str(val).strip():
+            return str(val)
+    return fallback
+
 future_rate_limit: dict[tuple[int, int], float] = defaultdict(float)
 ask_rate_limit: dict[tuple[int, int], float] = defaultdict(float)
 summary_rate_limit: dict[int, float] = defaultdict(float)
@@ -899,7 +925,7 @@ async def future(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         last_reason = ""
         chosen = ""
 
-        for _attempt in range(REGENERATION_ATTEMPTS):
+        for _attempt in range(max(REGENERATION_ATTEMPTS, 2)):
             extra = ""
             if last_reason:
                 extra = (
@@ -918,8 +944,11 @@ async def future(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 ],
             )
 
-            candidate = clean_bot_reply(response.choices[0].message.content or "")
+            candidate = clean_bot_reply(extract_llm_text(response))
             if not candidate:
+                # GLM sometimes returns reasoning-only / empty content — retry
+                logger.warning("Future: empty content from LLM (attempt %s), retrying", _attempt + 1)
+                last_reason = "пустой ответ от модели"
                 continue
 
             too_similar, reason = is_too_similar(candidate, previous)
@@ -1042,7 +1071,7 @@ async def ask(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await safe_send(update, "Не получилось ответить. Попробуй позже.")
         return
 
-    reply = clean_bot_reply(response.choices[0].message.content or "")
+    reply = clean_bot_reply(extract_llm_text(response))
     if not reply:
         reply = "Не получилось собрать внятный ответ."
 
@@ -1526,19 +1555,21 @@ def _message_addresses_bot(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if any(w in text_lower for w in trigger_words):
         return True
 
-    # whole-word "бот" / "bot" (not "работа", "ботан", "робот")
-    if re.search(r"(^|[\s,.:;!?«\"'(])бот([\s,.:;!?»\"')]|$)", text_lower):
+    # whole-word "бот" / "bot" only when it is a real bot-call, not embedded in
+    # normal words. Require it to be a standalone short token to avoid matching
+    # "работа", "робот", "ботан", etc. — but "еблобот"/"хуебот" already caught above.
+    if re.search(r"(^|[\s,.:;!?»\"'(])бот([\s,.:;!?»\"')]|$)", text_lower):
         return True
     if re.search(r"(^|[\s,.:;!?\"'(])bot([\s,.:;!?\"')]|$)", text_lower):
         return True
 
-    # any token that *is* a bot-call: *бот / *bot (еблобот, хуебот, mybot…)
-    # but reject long normal words containing бот mid-stem via length/suffix check
-    for tok in re.findall(r"[a-zа-я0-9_@]+", text_lower):
+    # Only accept *бот / *bot tokens that are explicit bot calls (еблобот, mybot…).
+    # Drop generic mid-stem matches to stop replying to unrelated swearing.
+    for tok in re.findall(r"[a-zа-яё0-9_@]+", text_lower):
         if tok in {"работа", "работать", "работаю", "ботаник", "ботан", "робот", "роботы"}:
             continue
         if tok.endswith("бот") or tok.endswith("bot") or tok.endswith("ботик"):
-            if 3 <= len(tok) <= 24:
+            if 4 <= len(tok) <= 24:
                 return True
 
     return False
@@ -1643,7 +1674,7 @@ async def chat_participant_reply(update: Update, context: ContextTypes.DEFAULT_T
         logger.exception("Participant reply failed")
         return
 
-    reply = clean_bot_reply(response.choices[0].message.content or "")
+    reply = clean_bot_reply(extract_llm_text(response))
     if not reply:
         return
 
