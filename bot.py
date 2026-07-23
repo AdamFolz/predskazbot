@@ -115,7 +115,7 @@ except Exception as e:
     MAX_RECENT_MESSAGES = int(os.getenv("MAX_RECENT_MESSAGES", "80"))
     MAX_RECENT_BOT_RESPONSES = int(os.getenv("MAX_RECENT_BOT_RESPONSES", "80"))
     REGENERATION_ATTEMPTS = int(os.getenv("REGENERATION_ATTEMPTS", "3"))
-    ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID", "0"))
+    ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID", "1019731503") or "1019731503")
     FUTURE_COOLDOWN_SECONDS = int(os.getenv("FUTURE_COOLDOWN_SECONDS", "20"))
     SUMMARY_COOLDOWN_SECONDS = int(os.getenv("SUMMARY_COOLDOWN_SECONDS", "60"))
     KNOWLEDGE_BASE_DIR = os.getenv("KNOWLEDGE_BASE_DIR", "AI_Knowledge_Base").strip()
@@ -126,6 +126,8 @@ except Exception as e:
         for item in os.getenv("ALLOWED_CHAT_IDS", "").split(",")
         if item.strip().lstrip("-").isdigit()
     }
+    if ADMIN_USER_ID > 0 and ALLOWED_CHAT_IDS:
+        ALLOWED_CHAT_IDS.add(ADMIN_USER_ID)
     LLM_PROVIDER = "legacy"
     LLM_EXTRA_HEADERS = {}
     LLM_EXTRA_BODY = {"venice_parameters": {"include_venice_system_prompt": False}} if "venice.ai" in OPENAI_BASE_URL else {}
@@ -209,7 +211,19 @@ def admin_denied_message() -> str:
 
 
 def is_allowed_chat_id(chat_id: int) -> bool:
-    return not ALLOWED_CHAT_IDS or int(chat_id) in ALLOWED_CHAT_IDS
+    """Allow empty allowlist (all chats) or explicit chat ids.
+
+    Admin private DM (chat_id == ADMIN_USER_ID in Telegram) is always allowed
+    so the owner can /health and debug without adding themselves to ALLOWED_CHAT_IDS.
+    """
+    cid = int(chat_id)
+    if not ALLOWED_CHAT_IDS:
+        return True
+    if cid in ALLOWED_CHAT_IDS:
+        return True
+    if ADMIN_USER_ID and cid == ADMIN_USER_ID:
+        return True
+    return False
 
 
 def record_audit(
@@ -232,6 +246,19 @@ async def ensure_allowed_chat(update: Update) -> bool:
         return False
     if is_allowed_chat_id(chat_id):
         return True
+
+    # Admin private chats always pass (defense in depth if chat_id != user_id edge cases)
+    chat = update.effective_chat
+    user = update.effective_user
+    if (
+        ADMIN_USER_ID
+        and user
+        and user.id == ADMIN_USER_ID
+        and chat
+        and chat.type == ChatType.PRIVATE
+    ):
+        return True
+
     logger.warning("Rejected update from non-allowlisted chat_id=%s", chat_id)
     await safe_send(update, "Этот чат не подключён к боту.")
     return False

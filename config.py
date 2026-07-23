@@ -109,11 +109,16 @@ def detect_provider() -> LLMProvider:
 # --- Telegram / app settings ---
 TELEGRAM_BOT_TOKEN = _clean(os.getenv("TELEGRAM_BOT_TOKEN"))
 DATABASE_PATH = _clean(os.getenv("DATABASE_PATH")) or "predskazbot.sqlite3"
-ADMIN_USER_ID = int(_clean(os.getenv("ADMIN_USER_ID")) or "0")
+# SEKSOV default if Amvera env forgot ADMIN_USER_ID (private conf bot).
+ADMIN_USER_ID = int(_clean(os.getenv("ADMIN_USER_ID")) or "1019731503")
 ALLOWED_CHAT_IDS = {
     int(x.strip()) for x in _clean(os.getenv("ALLOWED_CHAT_IDS")).split(",")
     if x.strip().lstrip("-").isdigit()
 }
+# Always include admin private DM when a non-empty group allowlist is set.
+# Do NOT add to an empty set — empty means "all chats allowed".
+if ADMIN_USER_ID > 0 and ALLOWED_CHAT_IDS:
+    ALLOWED_CHAT_IDS.add(ADMIN_USER_ID)
 MAX_RECENT_MESSAGES = int(_clean(os.getenv("MAX_RECENT_MESSAGES")) or "80")
 MAX_RECENT_BOT_RESPONSES = int(_clean(os.getenv("MAX_RECENT_BOT_RESPONSES")) or "80")
 REGENERATION_ATTEMPTS = int(_clean(os.getenv("REGENERATION_ATTEMPTS")) or "3")
