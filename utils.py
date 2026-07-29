@@ -98,9 +98,44 @@ def safe_format(template: str, **kwargs) -> str:
 
 
 def clean_bot_reply(text: str) -> str:
+    if not text:
+        return ""
     text = text.strip()
-    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+
+    # Strip common reasoning / chain-of-thought blocks
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
+    text = re.sub(r"```(?:\w+)?\s*.*?\s*```", "", text, flags=re.DOTALL)
+
+    # Aggressively remove leaked meta-reasoning (the main bug you are seeing)
+    # These patterns appear when user pastes "Нужно:" planning text or model echoes instructions
+    meta_patterns = [
+        r"Нужно[:\s].*?(?=\n\n|\n[А-ЯA-Z]|\Z)",
+        r"Важно[:\s].*?(?=\n\n|\n[А-ЯA-Z]|\Z)",
+        r"Варианты[:\s].*?(?=\n\n|\n[А-ЯA-Z]|\Z)",
+        r"Нужно отреагировать.*?(?=\n\n|\n[А-ЯA-Z]|\Z)",
+        r"1\.\s*(Сыграть|Подколоть|Отреагировать|Начать с).*?(?=\n\n|\n[2-9]\.|\Z)",
+        r"SEKSOV говорит.*?(?=\n\n|\n[А-ЯA-Z]|\Z)",
+        r"wOnzA говорит.*?(?=\n\n|\n[А-ЯA-Z]|\Z)",
+        r"Андрей Конфа.*?(?=\n\n|\n[А-ЯA-Z]|\Z)",
+        r"^\s*\d+\.\s+(Подколоть|Сыграть|Отреагировать|Начать с|Просто).*",
+    ]
+    for pat in meta_patterns:
+        text = re.sub(pat, "", text, flags=re.IGNORECASE | re.DOTALL)
+
+    # Remove any remaining "planning" style lines
+    text = re.sub(r"^\s*(Нужно|Важно|Варианты|1\.|2\.|3\.|4\.)\s*.*$", "", text, flags=re.MULTILINE)
+
+    # Final cleanup
     text = re.sub(r"^```(?:\w+)?", "", text)
     text = re.sub(r"```$", "", text)
-    text = text.strip().strip('"').strip()
+    text = text.strip().strip('"').strip("'").strip()
+
+    # If after cleaning almost nothing left or it still looks like meta, return empty so caller can fallback
+    if len(text) < 5 or any(x in text.lower() for x in ["нужно отреагировать", "нужно:", "варианты:", "начать с seksov", "начать с wOnzA"]):
+        return ""
+
+    # Extra safety: if the reply still contains obvious planning markers after all stripping, nuke it
+    if re.search(r"(Нужно|Важно|Варианты)\s*:", text, re.IGNORECASE):
+        return ""
+
     return text

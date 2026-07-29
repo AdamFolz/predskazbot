@@ -1481,6 +1481,28 @@ def _message_addresses_bot(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if not msg or not msg.text:
         return False
 
+    text = msg.text.strip()
+    text_lower = text.lower().replace("ё", "е")
+
+    # IMPORTANT: ignore pure "prompt engineering" / planning messages that are copy-pasted
+    # These are the long "Нужно отреагировать...", "Варианты:", "1. Сыграть..." blocks
+    planning_markers = [
+        "нужно отреагировать",
+        "нужно:",
+        "важно:",
+        "варианты:",
+        "1. сыграть",
+        "1. подколоть",
+        "1. отреагировать",
+        "начать с seksov",
+        "начать с wOnzA",
+        "начать с андрей",
+    ]
+    if any(marker in text_lower for marker in planning_markers):
+        # looks like internal prompt copy-paste, do not treat as bot address
+        if len(text) > 120:
+            return False
+
     bot = context.bot
     bot_username = (bot.username or "").lower()
     bot_id = bot.id
@@ -1489,14 +1511,13 @@ def _message_addresses_bot(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         et = getattr(ent, "type", None)
         et_val = getattr(et, "value", et)
         if et_val == "mention":
-            mention = msg.text[ent.offset : ent.offset + ent.length].lower()
+            mention = text[ent.offset : ent.offset + ent.length].lower()
             if bot_username and mention == f"@{bot_username}":
                 return True
         elif et_val == "text_mention":
             if ent.user and ent.user.id == bot_id:
                 return True
 
-    text_lower = msg.text.lower().replace("ё", "е")
     # Slang / brand / diminutives used in the confa
     trigger_words = [
         "хуебот",
@@ -1526,14 +1547,12 @@ def _message_addresses_bot(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if any(w in text_lower for w in trigger_words):
         return True
 
-    # whole-word "бот" / "bot" (not "работа", "ботан", "робот")
+    # whole-word "бот" / "bot"
     if re.search(r"(^|[\s,.:;!?«\"'(])бот([\s,.:;!?»\"')]|$)", text_lower):
         return True
     if re.search(r"(^|[\s,.:;!?\"'(])bot([\s,.:;!?\"')]|$)", text_lower):
         return True
 
-    # any token that *is* a bot-call: *бот / *bot (еблобот, хуебот, mybot…)
-    # but reject long normal words containing бот mid-stem via length/suffix check
     for tok in re.findall(r"[a-zа-я0-9_@]+", text_lower):
         if tok in {"работа", "работать", "работаю", "ботаник", "ботан", "робот", "роботы"}:
             continue
@@ -1547,6 +1566,20 @@ def _message_addresses_bot(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 async def chat_participant_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message or not update.message.text:
         return
+
+    user_text = update.message.text.strip()
+
+    # Hard filter: if the incoming message itself looks like a leaked planning / prompt-engineering dump,
+    # do NOT reply at all (this was causing the exact screenshots you sent).
+    planning_markers = [
+        "нужно отреагировать", "нужно:", "важно:", "варианты:",
+        "1. сыграть", "1. подколоть", "1. отреагировать", "начать с seksov",
+        "начать с wOnzA", "начать с андрей"
+    ]
+    text_lower = user_text.lower()
+    if any(m in text_lower for m in planning_markers) and len(user_text) > 80:
+        return
+
     chat_id = await resolve_target_chat_id(update)
     user_id = user_id_of(update)
 
@@ -1562,7 +1595,6 @@ async def chat_participant_reply(update: Update, context: ContextTypes.DEFAULT_T
         user_profile = memory_manager.build_context_for_user(chat_id, user_id, 5)
 
         # Live web: on by intent (weather/курс/факт), or forced via env.
-        # LIVE_WEB_ON_PARTICIPANT=0 disables; =1 always tries; default=auto.
         _lw_mode = os.getenv("LIVE_WEB_ON_PARTICIPANT", "auto").strip().lower()
         _want_web = False
         if _lw_mode in ("1", "true", "yes", "on"):
@@ -1572,12 +1604,12 @@ async def chat_participant_reply(update: Update, context: ContextTypes.DEFAULT_T
         else:
             try:
                 from web_search import needs_live_web
-                _want_web = needs_live_web(update.message.text)
+                _want_web = needs_live_web(user_text)
             except Exception:
                 _want_web = False
         if _want_web:
             from web_search import live_web_context
-            live_web = await live_web_context(update.message.text, force=False)
+            live_web = await live_web_context(user_text, force=False)
             if live_web:
                 chat_context = safe_short(
                     chat_context + "\n\nАКТУАЛЬНЫЕ ДАННЫЕ ИЗ ИНТЕРНЕТА (только что получено):\n" + live_web,
@@ -1593,7 +1625,7 @@ async def chat_participant_reply(update: Update, context: ContextTypes.DEFAULT_T
                 "content": safe_format(
                     PARTICIPANT_PROMPT,
                     user_name=user_display_name(update),
-                    message_text=update.message.text,
+                    message_text=user_text,
                     chat_context=chat_context,
                     user_profile=user_profile,
                 ),
@@ -1643,8 +1675,16 @@ async def chat_participant_reply(update: Update, context: ContextTypes.DEFAULT_T
         logger.exception("Participant reply failed")
         return
 
-    reply = clean_bot_reply(response.choices[0].message.content or "")
-    if not reply:
+    raw_reply = response.choices[0].message.content or ""
+    reply = clean_bot_reply(raw_reply)
+
+    # Extra hard guard against leaked reasoning (exactly the bug in your screenshots)
+    if not reply or len(reply) < 8:
+        return
+
+    bad_markers = ["нужно", "важно", "варианты", "1. сыграть", "1. подколоть", "seksov говорит", "wOnzA пишет"]
+    if any(m in reply.lower() for m in bad_markers):
+        logger.warning("Dropped leaky participant reply containing planning text")
         return
 
     try:
